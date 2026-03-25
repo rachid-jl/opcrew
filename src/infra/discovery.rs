@@ -269,17 +269,41 @@ impl DiscoveryAgent {
             content: prompt,
         }];
 
-        let (response, _) = self
-            .client
-            .send_message(COMMAND_GEN_SYSTEM_PROMPT, &messages)
-            .await?;
+        // Try up to 3 times — LLMs sometimes produce malformed JSON
+        let mut last_response = String::new();
+        let mut conversation = messages;
 
-        let json_str = crate::api::schema::extract_json(&response);
-        let commands: Vec<DiscoveryCommand> = serde_json::from_str(&json_str)
-            .map_err(|e| AgentError::InfraError(format!("Parse commands: {e}")))?;
+        for attempt in 0..3 {
+            let (response, _) = self
+                .client
+                .send_message(COMMAND_GEN_SYSTEM_PROMPT, &conversation)
+                .await?;
 
-        // Cap at 30 commands
-        Ok(commands.into_iter().take(30).collect())
+            let json_str = crate::api::schema::extract_json(&response);
+            match serde_json::from_str::<Vec<DiscoveryCommand>>(&json_str) {
+                Ok(commands) => return Ok(commands.into_iter().take(30).collect()),
+                Err(e) => {
+                    tracing::warn!(attempt, error = %e, "LLM returned invalid command JSON, retrying");
+                    last_response = response;
+                    // Add feedback for retry
+                    conversation.push(ChatMessage {
+                        role: MessageRole::Assistant,
+                        content: last_response.clone(),
+                    });
+                    conversation.push(ChatMessage {
+                        role: MessageRole::User,
+                        content: format!(
+                            "Your JSON is invalid: {e}. Fix it and return ONLY a valid JSON array."
+                        ),
+                    });
+                }
+            }
+        }
+
+        Err(AgentError::InfraError(format!(
+            "Failed to get valid command list after 3 attempts. Last response: {}",
+            &last_response[..last_response.len().min(200)]
+        )))
     }
 
     /// Phase 3: Execute commands with failure classification.
