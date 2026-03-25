@@ -104,7 +104,11 @@ impl SpecialistAgent {
             });
 
             // Check if the response contains a tool call (simple JSON detection)
+            tracing::debug!(agent = %self.config.role, response_len = response.len(),
+                response_preview = %&response[..response.len().min(300)], "Agent response");
             if let Some(tool_call) = extract_tool_call(&response) {
+                tracing::info!(agent = %self.config.role, tool = %tool_call.tool_name,
+                    action = %tool_call.action, "Tool call detected");
                 // Guardian review
                 let context = &conversation
                     .last()
@@ -169,6 +173,7 @@ impl SpecialistAgent {
                 }
             } else {
                 // No tool call — this is the agent's final answer
+                tracing::debug!(agent = %self.config.role, "No tool call detected, treating as final answer");
                 break;
             }
 
