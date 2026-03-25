@@ -382,35 +382,87 @@ async fn run_pipeline(
         .map(HypothesisAgent::format_for_ceo)
         .unwrap_or_default();
 
-    let is_simple = hypothesis_report.as_ref()
-        .map(|r| r.estimated_complexity == crate::agents::hypothesis::Complexity::Simple)
-        .unwrap_or(false);
+    // =========================================================
+    // Smart routing: decide fast-path vs full pipeline
+    // =========================================================
+    let approach_stats = if let Some(mem) = memory.as_ref() {
+        mem.get_approach_stats(p_hash).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let past_worked = if let Some(mem) = memory.as_ref() {
+        mem.find_similar_solutions(p_hash).unwrap_or_default().iter().any(|s| s.worked)
+    } else {
+        false
+    };
 
-    // =========================================================
-    // Fast-path for Simple problems
-    // =========================================================
-    if is_simple && !cli.dry_run
+    let route = crate::execution::routing::compute_route(
+        problem, hypothesis_report.as_ref(), &approach_stats, past_worked,
+    );
+    tracing::info!(route = %route, "Routing decision");
+    if !cli.json {
+        println!("{}", formatter.format_progress("Router", &format!("{route}")));
+    }
+
+    // Handle memory replay
+    if let crate::execution::routing::RouteDecision::MemoryReplay { approach, solution, .. } = &route
+        && !cli.dry_run {
+            tracing::info!(approach = %approach, "Memory replay: applying known solution");
+            if !cli.json {
+                println!("{}", formatter.format_progress("Memory", &format!("Replaying known fix: {approach}")));
+            }
+            // Run a single agent with the known approach
+            let replay_prompt = format!(
+                "A previous session solved this same problem. Apply the known fix:\n\n\
+                 Approach: {approach}\n\
+                 Previous result: {solution}\n\n\
+                 Problem: {problem}\n\n\
+                 Apply the fix and verify it worked."
+            );
+            let replay_config = crate::domain::agent::AgentConfig {
+                id: crate::domain::agent::AgentId::new(),
+                role: "Memory Replay".into(),
+                expertise: vec!["remediation".into()],
+                system_prompt: crate::agents::factory::SPECIALIST_SYSTEM_PROMPT.to_string(),
+                goal: "Replay known fix".into(),
+                allowed_tools: vec!["shell".into(), "file_ops".into(), "log_reader".into()],
+                token_budget: 400_000,
+                max_conversation_turns: 15,
+            };
+            let replay_agent = crate::agents::specialist::SpecialistAgent::new(
+                replay_config, Arc::clone(client), Arc::clone(tool_registry),
+                Arc::clone(guardian), Arc::clone(budget), Arc::clone(masker), Arc::clone(metrics),
+            );
+            match replay_agent.execute(&replay_prompt).await {
+                Ok(output) => {
+                    metrics.record_tokens(output.tokens_used);
+                    println!("{}", formatter.format_final_result(&output.content, metrics.total_tokens()));
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Memory replay failed, falling back");
+                }
+            }
+        }
+
+    // Handle fast-path
+    if route.is_fast() && !cli.dry_run
         && let Some(report) = &hypothesis_report
-            && let Some(top_hypothesis) = report.hypotheses.first() {
-                tracing::info!(hypothesis = %top_hypothesis.id, "Fast-path: Simple problem, running direct diagnostic");
+            && let Some(top) = report.hypotheses.first() {
+                tracing::info!(hypothesis = %top.id, "Fast-path: running direct diagnostic + fix");
                 if !cli.json {
                     println!("{}", formatter.format_progress("Fast-path",
-                        &format!("Simple problem — testing H1: {}", &top_hypothesis.description[..top_hypothesis.description.len().min(60)])));
+                        &format!("Testing {}: {}", top.id, &top.description[..top.description.len().min(60)])));
                 }
 
-                // Create a single specialist to confirm + fix
                 let fast_prompt = format!(
-                    "You are a fast diagnostic agent. Do these steps IN ORDER:\n\
-                     1. Run this command to confirm the hypothesis: {}\n\
-                     2. If confirmed, apply this fix: {}\n\
-                     3. Verify the fix worked\n\
-                     4. Report the result\n\n\
-                     Hypothesis: {}\n\
-                     Problem: {problem}",
-                    top_hypothesis.confirm_by, top_hypothesis.fix_approach,
-                    top_hypothesis.description,
+                    "Do these steps IN ORDER:\n\
+                     1. Run: {} (to confirm the hypothesis)\n\
+                     2. If confirmed, apply fix: {}\n\
+                     3. Verify the fix worked\n\n\
+                     Hypothesis: {}\nProblem: {problem}",
+                    top.confirm_by, top.fix_approach, top.description,
                 );
-
                 let fast_config = crate::domain::agent::AgentConfig {
                     id: crate::domain::agent::AgentId::new(),
                     role: "Fast Diagnostic".into(),
@@ -421,22 +473,14 @@ async fn run_pipeline(
                     token_budget: 400_000,
                     max_conversation_turns: 20,
                 };
-
                 let fast_agent = crate::agents::specialist::SpecialistAgent::new(
-                    fast_config,
-                    Arc::clone(client),
-                    Arc::clone(tool_registry),
-                    Arc::clone(guardian),
-                    Arc::clone(budget),
-                    Arc::clone(masker),
-                    Arc::clone(metrics),
+                    fast_config, Arc::clone(client), Arc::clone(tool_registry),
+                    Arc::clone(guardian), Arc::clone(budget), Arc::clone(masker), Arc::clone(metrics),
                 );
-
                 match fast_agent.execute(&fast_prompt).await {
                     Ok(output) => {
                         metrics.record_tokens(output.tokens_used);
                         println!("{}", formatter.format_final_result(&output.content, metrics.total_tokens()));
-
                         if let Some(mem) = memory.as_ref() {
                             let _ = mem.save_finding(&FindingRecord {
                                 id: Uuid::new_v4().to_string(),
