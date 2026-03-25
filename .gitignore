@@ -1,1 +1,4 @@
 /target
+audit.log
+audit.log.*
+.env
