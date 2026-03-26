@@ -8,6 +8,7 @@ use crate::domain::task::{Task, TaskId};
 use crate::error::Result;
 use crate::execution::budget::TokenBudget;
 use crate::safety::guardian::GuardianAgent;
+use crate::infra::graph::InfraGraph;
 use crate::observability::metrics::Metrics;
 use crate::safety::secrets::SecretMasker;
 use crate::tools::registry::ToolRegistry;
@@ -21,6 +22,7 @@ pub struct AgentFactory {
     budget: Arc<TokenBudget>,
     masker: Arc<SecretMasker>,
     metrics: Arc<Metrics>,
+    infra_graph: Arc<std::sync::RwLock<Option<InfraGraph>>>,
 }
 
 impl AgentFactory {
@@ -31,6 +33,7 @@ impl AgentFactory {
         budget: Arc<TokenBudget>,
         masker: Arc<SecretMasker>,
         metrics: Arc<Metrics>,
+        infra_graph: Arc<std::sync::RwLock<Option<InfraGraph>>>,
     ) -> Self {
         Self {
             client,
@@ -39,6 +42,7 @@ impl AgentFactory {
             budget,
             masker,
             metrics,
+            infra_graph,
         }
     }
 
@@ -94,7 +98,8 @@ impl AgentFactory {
     }
 
     fn create_specialist(&self, role: &PlannedRole) -> Result<SpecialistAgent> {
-        let system_prompt = generate_system_prompt(role);
+        let service_catalog = self.build_service_catalog();
+        let system_prompt = generate_system_prompt(role, &service_catalog);
 
         let config = AgentConfig {
             id: AgentId::new(),
@@ -117,11 +122,38 @@ impl AgentFactory {
             Arc::clone(&self.metrics),
         ))
     }
+
+    /// Build a service catalog string from the infra graph for agent prompts.
+    fn build_service_catalog(&self) -> String {
+        let graph = self.infra_graph.read().unwrap();
+        let graph = match graph.as_ref() {
+            Some(g) if !g.services.is_empty() => g,
+            _ => return String::new(),
+        };
+
+        let mut catalog = String::from("KNOWN SERVICES (use these exact names with the service tool):\n");
+        for svc in graph.services.values() {
+            let port = svc.port.map(|p| format!(":{p}")).unwrap_or_default();
+            catalog.push_str(&format!(
+                "- {} ({}, {:?}{}) — use: {{\"tool\": \"service\", \"args\": {{\"service\": \"{}\"}}}}\n",
+                svc.name, svc.execution_context.runtime, svc.service_type, port, svc.name,
+            ));
+        }
+        catalog.push_str("\nIMPORTANT: Use the EXACT service name from this list. Do NOT use generic names like 'nginx' if the service is called 'test-web'.\n");
+        catalog
+    }
 }
 
-fn generate_system_prompt(role: &PlannedRole) -> String {
+fn generate_system_prompt(role: &PlannedRole, service_catalog: &str) -> String {
+    let catalog_section = if service_catalog.is_empty() {
+        String::new()
+    } else {
+        format!("\n{service_catalog}\n")
+    };
+
     format!(
         r#"You are a specialist agent with the role: {role_name}.
+{catalog}
 
 Your areas of expertise: {expertise}
 
@@ -170,6 +202,7 @@ RESULT: [what you found and did]
 HYPOTHESIS: confirmed/denied
 EVIDENCE: [key evidence]"#,
         role_name = role.role_name,
+        catalog = catalog_section,
         expertise = role.expertise.join(", "),
         responsibility = role.responsibility,
         tools = role.allowed_tools.join(", "),
@@ -210,7 +243,7 @@ mod tests {
             target_host: None,
         };
 
-        let prompt = generate_system_prompt(&role);
+        let prompt = generate_system_prompt(&role, "");
         assert!(prompt.contains("Log Analyst"));
         assert!(prompt.contains("log analysis"));
         assert!(prompt.contains("Analyze nginx logs"));

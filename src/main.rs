@@ -278,6 +278,7 @@ async fn main() -> anyhow::Result<()> {
         cancellation: cancellation.clone(),
         metrics: Arc::clone(&metrics),
         memory: memory.clone(),
+        infra_graph: Arc::clone(&infra_graph),
     };
     let pipeline_result = tokio::time::timeout(
         timeout_duration,
@@ -320,6 +321,7 @@ struct PipelineCtx {
     cancellation: CancellationToken,
     metrics: Arc<Metrics>,
     memory: Option<Arc<MemoryStore>>,
+    infra_graph: Arc<std::sync::RwLock<Option<InfraGraph>>>,
 }
 
 /// The main pipeline: clarity → hypothesis → CEO plan → squad → verify → replan loop → memory save
@@ -761,6 +763,7 @@ async fn run_pipeline(
         let factory = AgentFactory::new(
             Arc::clone(client), Arc::clone(tool_registry), Arc::clone(guardian),
             Arc::clone(budget), Arc::clone(masker), Arc::clone(metrics),
+            Arc::clone(&ctx.infra_graph),
         );
         let squad = factory.create_squad_from_plan(&plan, cli.max_agents)?;
         let runner = SquadRunner::new(Arc::clone(&ceo), cancellation.clone());
@@ -775,6 +778,7 @@ async fn run_pipeline(
     let factory = AgentFactory::new(
         Arc::clone(client), Arc::clone(tool_registry), Arc::clone(guardian),
         Arc::clone(budget), Arc::clone(masker), Arc::clone(metrics),
+        Arc::clone(&ctx.infra_graph),
     );
     let verifier = VerifierAgent::new(
         Arc::clone(client), Arc::clone(tool_registry),
